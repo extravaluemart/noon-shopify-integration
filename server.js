@@ -58,7 +58,7 @@ app.get('/oauth/callback', async (req, res) => {
       client_id: clientId, client_secret: clientSecret, code
     });
     const { access_token, scope } = tokenRes.data;
-    res.json({ success: true, access_token, scope });
+    res.redirect(`https://admin.shopify.com/store/daatir-jd#shopify_token=${access_token}`);
   } catch (err) {
     res.status(500).json({ error: err.message, details: err.response?.data });
   }
