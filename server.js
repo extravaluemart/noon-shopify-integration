@@ -46,6 +46,24 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'dashboard', 'index.html'));
 });
 
+// ─── OAuth Callback (for initial token acquisition) ───────────────────
+app.get('/oauth/callback', async (req, res) => {
+  const { code, state, shop } = req.query;
+  if (!code) return res.status(400).json({ error: 'No code provided' });
+  const clientId     = process.env.SHOPIFY_CLIENT_ID     || 'd784b60d8ac0fc3f4bd024c718541ef3';
+  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET || '';
+  const shopDomain   = shop || `${process.env.SHOPIFY_STORE}.myshopify.com`;
+  try {
+    const tokenRes = await axios.post(`https://${shopDomain}/admin/oauth/access_token`, {
+      client_id: clientId, client_secret: clientSecret, code
+    });
+    const { access_token, scope } = tokenRes.data;
+    res.json({ success: true, access_token, scope });
+  } catch (err) {
+    res.status(500).json({ error: err.message, details: err.response?.data });
+  }
+});
+
 // ─── Shopify Webhook Registration ────────────────────────────────────
 // Registers the required Shopify webhooks pointing to THIS server.
 // Run once on startup — Shopify silently ignores duplicates.
