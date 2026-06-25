@@ -1,44 +1,88 @@
 /**
  * Noon Partner FBPI API client
  *
- * Base URLs per country:
- *   UAE: https://api.noon.partners/v1  (env = ae)
- *   KSA: https://api.noon.partners/v1  (env = sa)
- *   Egypt: https://api.noon.partners/v1 (env = eg)
+ * Authentication: RS256 JWT client assertion (apijwt type)
  *
- * Authentication: JWT via client_credentials grant.
  * Credentials come from store_credentials.json downloaded from
- * Noon Partner Dashboard → User Access → API Users.
+ * Noon Partner Dashboard → User Access → API Users (type: apijwt).
+ *
+ * Required env vars:
+ *   NOON_CLIENT_ID      → key_id from credentials JSON
+ *   NOON_CLIENT_SECRET  → private_key PEM (newlines can be literal \n or \\n)
+ *   NOON_CHANNEL_ID     → channel_identifier from credentials JSON
+ *   NOON_PROJECT_ID     → project_code (e.g. PRJ474943)
+ *   NOON_ENV            → ae | sa | eg (default: ae)
  */
 
-const axios = require('axios');
+const axios   = require('axios');
+const jwt     = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
 
-const CLIENT_ID     = process.env.NOON_CLIENT_ID;
-const CLIENT_SECRET = process.env.NOON_CLIENT_SECRET;
-const PROJECT_ID    = process.env.NOON_PROJECT_ID;  // e.g. "PRJ123456"
-const ENV           = process.env.NOON_ENV || 'ae'; // ae | sa | eg
+const KEY_ID         = process.env.NOON_CLIENT_ID;
+const CHANNEL_ID     = process.env.NOON_CHANNEL_ID;   // channel_identifier
+const PROJECT_ID     = process.env.NOON_PROJECT_ID;   // e.g. "PRJ474943"
+const ENV            = process.env.NOON_ENV || 'ae';
 
-// NOTE: Noon provides the exact base URL in your store_credentials.json.
-// Update BASE_URL if yours differs.
-const BASE_URL = `https://api.noon.partners/v1`;
+// Handle private key stored with escaped newlines (common in env vars / Vercel)
+const PRIVATE_KEY = (process.env.NOON_CLIENT_SECRET || '').replace(/\\n/g, '\n');
+
+// Derive IDP token endpoint from channel_identifier
+// Format: storename@{realm}.idp.noon.partners
+// → https://idp.noon.partners/auth/realms/{realm}/protocol/openid-connect/token
+function getTokenEndpoint() {
+  if (!CHANNEL_ID) throw new Error('NOON_CHANNEL_ID is not set');
+  // Extract realm from "extravaluemart@p474943.idp.noon.partners"
+  const match = CHANNEL_ID.match(/@([^.]+)\.idp\.noon\.partners/);
+  if (!match) throw new Error(`Cannot parse realm from NOON_CHANNEL_ID: ${CHANNEL_ID}`);
+  const realm = match[1];
+  return `https://idp.noon.partners/auth/realms/${realm}/protocol/openid-connect/token`;
+}
+
+const BASE_URL = 'https://api.noon.partners/v1';
 
 let _token = null;
 let _tokenExpiry = 0;
 
 /**
- * Get a valid Noon JWT access token (auto-refreshes when expired).
+ * Get a valid Noon access token using RS256 JWT client assertion.
+ * Auto-refreshes when expired.
  */
 async function getToken() {
   if (_token && Date.now() < _tokenExpiry - 30000) return _token;
 
-  const res = await axios.post(`${BASE_URL}/auth/token`, {
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
-    grant_type: 'client_credentials'
+  const tokenEndpoint = getTokenEndpoint();
+  const now = Math.floor(Date.now() / 1000);
+
+  // Build the JWT assertion signed with the RS256 private key
+  const assertion = jwt.sign(
+    {
+      iss: KEY_ID,
+      sub: KEY_ID,
+      aud: tokenEndpoint,
+      jti: uuidv4(),
+      iat: now,
+      exp: now + 300   // 5-minute validity
+    },
+    PRIVATE_KEY,
+    {
+      algorithm: 'RS256',
+      header: { kid: KEY_ID, alg: 'RS256' }
+    }
+  );
+
+  // Exchange the JWT assertion for an access token
+  const params = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: KEY_ID,
+    client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+    client_assertion: assertion
+  });
+
+  const res = await axios.post(tokenEndpoint, params.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
   });
 
   _token = res.data.access_token;
-  // Typically expires in 3600s; subtract 60s buffer
   _tokenExpiry = Date.now() + ((res.data.expires_in || 3600) - 60) * 1000;
   return _token;
 }
@@ -66,9 +110,6 @@ async function request(method, path, data = null, params = null) {
 
 /**
  * Update inventory for a single SKU on Noon.
- * @param {string} sku         - The partner SKU code (must match what's on Noon listing)
- * @param {number} quantity    - New available quantity
- * @param {string} warehouseId - Your Noon integration warehouse ID
  */
 async function updateInventory(sku, quantity, warehouseId) {
   return request('PUT', '/fulfillment/inventory', {
@@ -79,12 +120,9 @@ async function updateInventory(sku, quantity, warehouseId) {
 }
 
 /**
- * Bulk update inventory for multiple SKUs in one call.
- * @param {Array<{sku, quantity}>} items
- * @param {string} warehouseId
+ * Bulk update inventory for multiple SKUs (batches of 100).
  */
 async function bulkUpdateInventory(items, warehouseId) {
-  // Noon supports batches; chunk to 100 items per call
   const BATCH = 100;
   const results = [];
   for (let i = 0; i < items.length; i += BATCH) {
@@ -101,21 +139,12 @@ async function bulkUpdateInventory(items, warehouseId) {
 
 // ─── ORDERS ────────────────────────────────────────────────────────────
 
-/**
- * Acknowledge a Noon order (confirm you can fulfill it).
- * @param {string} orderId - Noon order ID
- */
 async function acknowledgeOrder(orderId) {
   return request('POST', `/fulfillment/orders/${orderId}/acknowledge`, {
     project_id: PROJECT_ID
   });
 }
 
-/**
- * Reject a Noon order (e.g. out of stock).
- * @param {string} orderId
- * @param {string} reason   - e.g. "out_of_stock"
- */
 async function rejectOrder(orderId, reason = 'out_of_stock') {
   return request('POST', `/fulfillment/orders/${orderId}/reject`, {
     project_id: PROJECT_ID,
@@ -125,16 +154,6 @@ async function rejectOrder(orderId, reason = 'out_of_stock') {
 
 // ─── SHIPMENTS ─────────────────────────────────────────────────────────
 
-/**
- * Create a shipment on Noon (after packing & handing over to courier).
- * This is what closes the loop and tells Noon the order has shipped.
- *
- * @param {string} noonOrderId     - Noon order ID
- * @param {string} trackingNumber  - Courier tracking number
- * @param {string} trackingCompany - Courier name (e.g. "Aramex", "DHL")
- * @param {Array}  items           - [{sku, quantity}]
- * @param {string} warehouseId     - Your integration warehouse ID
- */
 async function createShipment({ noonOrderId, trackingNumber, trackingCompany, items, warehouseId }) {
   return request('POST', '/fulfillment/shipments', {
     project_id: PROJECT_ID,
@@ -145,35 +164,3 @@ async function createShipment({ noonOrderId, trackingNumber, trackingCompany, it
     items: items.map(({ sku, quantity }) => ({ sku, quantity }))
   });
 }
-
-/**
- * Get current status of a Noon order.
- */
-async function getOrder(noonOrderId) {
-  return request('GET', `/fulfillment/orders/${noonOrderId}`, null, {
-    project_id: PROJECT_ID
-  });
-}
-
-/**
- * List recent Noon orders (for dashboard sync check).
- */
-async function listOrders({ status, limit = 20, page = 1 } = {}) {
-  return request('GET', '/fulfillment/orders', null, {
-    project_id: PROJECT_ID,
-    status,
-    limit,
-    page
-  });
-}
-
-module.exports = {
-  getToken,
-  updateInventory,
-  bulkUpdateInventory,
-  acknowledgeOrder,
-  rejectOrder,
-  createShipment,
-  getOrder,
-  listOrders
-};
